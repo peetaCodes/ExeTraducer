@@ -1,84 +1,63 @@
+# dynamic_loader.py
+#TODO map and resolve each call
 import pefile
 import capstone
 
+# Costanti capstone per comodità
+CS_OP_MEM = capstone.CS_OP_MEM
+CS_OP_IMM = capstone.CS_OP_IMM
+CS_OP_REG = capstone.CS_OP_REG
+
 class DynamicLoaderAnalyzer:
-    def __init__(self, pe):
+    def __init__(self, pe: pefile.PE):
         self.pe = pe
-        # Capstone (x86 32-bit)
+
+        # Capstone disasm (x86 32-bit)
         self.md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
         self.md.detail = True
 
-        # Stato per l’analisi
-        self.registers_current_values = {r: 0 for r in ['eax','ebx','ecx','edx','esi','edi','esp','ebp']}
+        # Disassembly cache
         self._last_instructions = None
         self._addr_to_index = None
 
-        # Mappa indirizzo_import → nome_funzione (riempita on-demand)
+        # Mappe di import / thunk (popolate da build_full_import_maps)
+        self.iat_slot_to_name = {}
+        self.thunk_to_name = {}
+
+        # Mappa indirizzo_import -> nome funzione (semplificata)
         self.func_addr_map = {}
 
-    # ----------------- Setup/Disassemblaggio -----------------
-
+    # -----------------------------
+    # Disassemblaggio e caching
+    # -----------------------------
     def ensure_disassembled(self):
+        """Disassembla la sezione .text se non è già presente in cache."""
         if self._last_instructions is not None and self._addr_to_index is not None:
             return
-        text = None
+
+        text_sec = None
         for s in self.pe.sections:
             name = s.Name.decode(errors='ignore').rstrip('\x00')
             if name == '.text':
-                text = s
+                text_sec = s
                 break
-        if not text:
-            self._last_instructions, self._addr_to_index = [], {}
+
+        if not text_sec:
+            self._last_instructions = []
+            self._addr_to_index = {}
             return
-        code = text.get_data()
-        base = self.pe.OPTIONAL_HEADER.ImageBase + text.VirtualAddress
+
+        code = text_sec.get_data()
+        base = self.pe.OPTIONAL_HEADER.ImageBase + text_sec.VirtualAddress
         insns = list(self.md.disasm(code, base))
         self._last_instructions = insns
         self._addr_to_index = {ins.address: i for i, ins in enumerate(insns)}
 
-    def build_full_import_maps(self):
-        """
-        Costruisce:
-          - self.iat_slot_to_name: { IAT_slot_abs_VA -> "Kernel32.dll!LoadLibraryA" }
-          - self.thunk_to_name:    { stub_addr_in_text -> "Kernel32.dll!LoadLibraryA" }
-        """
-        self.iat_slot_to_name = {}
-        self.thunk_to_name = {}
-
-        if not hasattr(self.pe, 'DIRECTORY_ENTRY_IMPORT'):
-            return
-
-        img_base = self.pe.OPTIONAL_HEADER.ImageBase
-
-        # 1) Mappa IAT slot -> nome funzione
-        for entry in self.pe.DIRECTORY_ENTRY_IMPORT:
-            dll = entry.dll.decode('utf-8', errors='ignore') if entry.dll else ''
-            for imp in entry.imports:
-                if not imp or not imp.address:
-                    continue
-                fname = imp.name.decode('utf-8', errors='ignore') if imp.name else None
-                if not fname:
-                    # import by ordinal; usa "ordinal#NNN"
-                    fname = f"ordinal#{imp.ordinal}" if imp.ordinal else "unknown"
-                self.iat_slot_to_name[imp.address] = f"{dll}!{fname}"
-
-        # 2) Cerca thunk nel .text: pattern "jmp dword ptr [abs]"
-        self.ensure_disassembled()
-        for ins in self._last_instructions:
-            if ins.mnemonic == 'jmp' and len(ins.operands) == 1:
-                op = ins.operands[0]
-                if op.type == capstone.x86.X86_OP_MEM:
-                    try:
-                        abs_mem = self.get_mem_operand_abs_address(op)
-                    except Exception:
-                        continue
-                    # se l'operand punta ad uno slot IAT, questo indirizzo "ins.address" è uno stub
-                    if abs_mem in self.iat_slot_to_name:
-                        self.thunk_to_name[ins.address] = self.iat_slot_to_name[abs_mem]
-
-    # ----------------- Letture memoria/registri -----------------
-
-    def read_memory_dword(self, absolute_address, size=4):
+    # -----------------------------
+    # Letture memoria dal PE
+    # -----------------------------
+    def read_memory_bytes(self, absolute_address, size):
+        """Legge 'size' byte dall'immagine mappata del PE dato un indirizzo assoluto (VA)."""
         data = self.pe.__data__
         img_base = self.pe.OPTIONAL_HEADER.ImageBase
         for sec in self.pe.sections:
@@ -89,306 +68,435 @@ class DynamicLoaderAnalyzer:
                 raw_off = sec.PointerToRawData + off_in_sec
                 if raw_off + size > len(data):
                     return None
-                chunk = data[raw_off:raw_off+size]
-                return int.from_bytes(chunk, 'little')
+                return data[raw_off: raw_off + size]
         return None
+
+    def read_memory_dword(self, absolute_address):
+        """Legge 4 byte little-endian dall'indirizzo assoluto (ritorna int)"""
+        chunk = self.read_memory_bytes(absolute_address, 4)
+        if not chunk or len(chunk) < 4:
+            return None
+        return int.from_bytes(chunk, 'little')
 
     def read_ascii_string_at(self, absolute_address, max_len=2048):
-        data = self.pe.__data__
-        img = self.pe.OPTIONAL_HEADER.ImageBase
-        for sec in self.pe.sections:
-            start = img + sec.VirtualAddress
-            end = start + max(sec.Misc_VirtualSize, sec.SizeOfRawData)
-            if start <= absolute_address < end:
-                off = sec.PointerToRawData + (absolute_address - start)
-                out = []
-                for i in range(max_len):
-                    if off + i >= len(data):
-                        break
-                    b = data[off + i]
-                    if b == 0:
-                        break
-                    if 32 <= b <= 126:
-                        out.append(chr(b))
-                    else:
-                        return None
-                return ''.join(out) if out else None
-        return None
+        """Prova a leggere una stringa ASCII stampabile da absolute_address."""
+        chunk = self.read_memory_bytes(absolute_address, max_len)
+        if not chunk:
+            return None
+        out = []
+        for b in chunk:
+            if b == 0:
+                break
+            if 32 <= b <= 126:
+                out.append(chr(b))
+            else:
+                return None
+        return ''.join(out) if out else None
 
     def read_utf16le_string_at(self, absolute_address, max_len=2048):
-        data = self.pe.__data__
-        img = self.pe.OPTIONAL_HEADER.ImageBase
-        for sec in self.pe.sections:
-            start = img + sec.VirtualAddress
-            end = start + max(sec.Misc_VirtualSize, sec.SizeOfRawData)
-            if start <= absolute_address < end:
-                off = sec.PointerToRawData + (absolute_address - start)
-                out = []
-                for i in range(0, max_len, 2):
-                    if off + i + 1 >= len(data):
-                        break
-                    lo = data[off + i]
-                    hi = data[off + i + 1]
-                    ch = lo | (hi << 8)
-                    if ch == 0:
-                        break
-                    # range unicode basilare stampabile
-                    if 32 <= ch <= 0xFFFF:
-                        out.append(chr(ch))
-                    else:
-                        return None
-                return ''.join(out) if out else None
-        return None
+        """Prova a leggere una stringa UTF-16LE da absolute_address."""
+        # max_len in byte (multiplo di 2 preferibile)
+        chunk = self.read_memory_bytes(absolute_address, max_len)
+        if not chunk:
+            return None
+        # Tentativo semplice: decodifica e prendi fino al primo \x00\x00
+        try:
+            s = chunk.decode('utf-16le', errors='strict')
+            return s.split('\x00', 1)[0]
+        except Exception:
+            return None
 
     def read_best_string_at(self, absolute_address):
-        s = self.read_ascii_string_at(absolute_address)
+        """Prova UTF-16LE prima, poi ASCII."""
+        s = self.read_utf16le_string_at(absolute_address)
         if s:
             return s
-        s = self.read_utf16le_string_at(absolute_address)
-        return s
+        return self.read_ascii_string_at(absolute_address)
 
-    def get_mem_operand_abs_address(self, op):
-        """op: ins.operands[n] (Capstone). type deve essere MEM."""
-        if op.type != capstone.x86.X86_OP_MEM:
-            raise ValueError("Operando non di tipo memoria (CS_OP_MEM).")
+    # -----------------------------
+    # Build import maps (IAT + thunk)
+    # -----------------------------
+    def build_full_import_maps(self):
+        """
+        Costruisce:
+          - self.iat_slot_to_name: VA_slot -> "DLL!Func"
+          - self.thunk_to_name: stub_va_in_.text -> "DLL!Func"  (se trovi stubs jmp [slot])
+        """
+        self.iat_slot_to_name = {}
+        self.thunk_to_name = {}
+        self.func_addr_map = {}
+
+        if not hasattr(self.pe, 'DIRECTORY_ENTRY_IMPORT'):
+            return
+
+        # IAT slots
+        for entry in self.pe.DIRECTORY_ENTRY_IMPORT:
+            dll = entry.dll.decode('utf-8', errors='ignore') if entry.dll else ''
+            for imp in entry.imports:
+                if not imp or not getattr(imp, 'address', None):
+                    continue
+                name = None
+                if imp.name:
+                    try:
+                        name = imp.name.decode('utf-8', errors='ignore')
+                    except Exception:
+                        name = None
+                if not name:
+                    name = f"ordinal#{getattr(imp, 'ordinal', '?')}"
+                self.iat_slot_to_name[imp.address] = f"{dll}!{name}"
+                # anche func_addr_map per lookup semplice
+                self.func_addr_map[imp.address] = f"{dll}!{name}"
+
+        # Detect thunk stubs nel .text: pattern "jmp dword ptr [abs]"
+        self.ensure_disassembled()
+        if not self._last_instructions:
+            return
+
+        for ins in self._last_instructions:
+            if ins.mnemonic == 'jmp' and len(ins.operands) == 1:
+                op = ins.operands[0]
+                if op.type == CS_OP_MEM:
+                    # ricaviamo l'indirizzo assoluto dell'operand se possibile (caso base/index == 0)
+                    addr = self._try_get_mem_operand_simple_abs(op)
+                    if addr and addr in self.iat_slot_to_name:
+                        self.thunk_to_name[ins.address] = self.iat_slot_to_name[addr]
+
+    def _try_get_mem_operand_simple_abs(self, op):
+        """
+        Calcolo semplice dell'indirizzo quando op.mem.base==0 and index==0.
+        Restituisce VA (abs) o None.
+        """
+        if op.type != CS_OP_MEM:
+            return None
         mem = op.mem
-        base_val = 0
-        idx_val = 0
-        if mem.base != 0:
-            base_val = self.registers_current_values.get(self.md.reg_name(mem.base), 0)
-        if mem.index != 0:
-            idx_val = self.registers_current_values.get(self.md.reg_name(mem.index), 0) * mem.scale
-        return base_val + idx_val + mem.disp
+        if mem.base == 0 and mem.index == 0:
+            # mem.disp è tipicamente un valore assoluto (o relativo al linker); proviamo come VA
+            return mem.disp
+        return None
 
-    def update_registers_from_instruction(self, ins):
+    # -----------------------------
+    # Helpers: register-state simulation (locale)
+    # -----------------------------
+    def _reg_name(self, reg_id):
+        return self.md.reg_name(reg_id)
+
+    def _update_reg_state_for_instruction(self, ins, reg_state):
+        """
+        Aggiorna reg_state (dict) con pattern semplici per MOV/XOR/LEA.
+        Non altera lo stato esterno della classe.
+        """
         try:
             if ins.mnemonic == 'mov' and len(ins.operands) >= 2:
                 dst, src = ins.operands[0], ins.operands[1]
-                if dst.type == capstone.x86.X86_OP_REG and src.type == capstone.x86.X86_OP_IMM:
-                    self.registers_current_values[self.md.reg_name(dst.reg)] = src.imm
-                elif dst.type == capstone.x86.X86_OP_REG and src.type == capstone.x86.X86_OP_REG:
-                    self.registers_current_values[self.md.reg_name(dst.reg)] = \
-                        self.registers_current_values.get(self.md.reg_name(src.reg), 0)
+                if dst.type == CS_OP_REG and src.type == CS_OP_IMM:
+                    reg_state[self._reg_name(dst.reg)] = src.imm
+                elif dst.type == CS_OP_REG and src.type == CS_OP_REG:
+                    reg_state[self._reg_name(dst.reg)] = reg_state.get(self._reg_name(src.reg), 0)
             elif ins.mnemonic == 'xor' and len(ins.operands) >= 2:
                 dst, src = ins.operands[0], ins.operands[1]
-                if dst.type == capstone.x86.X86_OP_REG and src.type == capstone.x86.X86_OP_REG and dst.reg == src.reg:
-                    self.registers_current_values[self.md.reg_name(dst.reg)] = 0
+                if dst.type == CS_OP_REG and src.type == CS_OP_REG and dst.reg == src.reg:
+                    reg_state[self._reg_name(dst.reg)] = 0
             elif ins.mnemonic == 'lea' and len(ins.operands) >= 2:
                 dst, src = ins.operands[0], ins.operands[1]
-                if dst.type == capstone.x86.X86_OP_REG and src.type == capstone.x86.X86_OP_MEM:
+                if dst.type == CS_OP_REG and src.type == CS_OP_MEM:
                     mem = src.mem
+                    # gestione semplice: se base==0,index==0 -> disp è indirizzo
                     if mem.base == 0 and mem.index == 0:
-                        self.registers_current_values[self.md.reg_name(dst.reg)] = mem.disp
+                        reg_state[self._reg_name(dst.reg)] = mem.disp
         except Exception:
             pass
 
-    # ----------------- Risoluzione call -----------------
+    # -----------------------------
+    # Calcolo indirizzo per operando MEM (usando reg_state)
+    # -----------------------------
+    def get_mem_operand_abs_address(self, op, reg_state=None):
+        """
+        Calcola indirizzo assoluto per op (operand di Capstone) se possibile.
+        reg_state è dict con valori di registro se disponibili; se None assume 0.
+        """
+        if op.type != CS_OP_MEM:
+            return None
+        mem = op.mem
+        base_val = 0
+        index_val = 0
+        if mem.base != 0:
+            if reg_state is None:
+                return None
+            base_reg = self._reg_name(mem.base)
+            base_val = reg_state.get(base_reg, 0)
+        if mem.index != 0:
+            if reg_state is None:
+                return None
+            index_reg = self._reg_name(mem.index)
+            index_val = reg_state.get(index_reg, 0) * mem.scale
+        return base_val + index_val + mem.disp
 
+    # -----------------------------
+    # Risoluzione target diretto/indiretto
+    # -----------------------------
     def resolve_direct_target(self, target_abs):
-        """
-        Prova a risolvere una CALL diretta:
-        - se target è in thunk_to_name => ritorna quel nome (API)
-        - se target è in iat_slot_to_name => improbabile per call diretta, ma gestiamo comunque
-        - se target cade in .text e non è thunk => presumibilmente funzione interna
-        """
-        if hasattr(self, 'thunk_to_name') and target_abs in self.thunk_to_name:
+        """Risolvi target di call diretta (IMM) usando thunk/IAT heuristics."""
+        # thunk first
+        if target_abs in self.thunk_to_name:
             return self.thunk_to_name[target_abs]
-
-        if hasattr(self, 'iat_slot_to_name') and target_abs in self.iat_slot_to_name:
+        if target_abs in self.iat_slot_to_name:
             return self.iat_slot_to_name[target_abs]
-
-        # Heuristica: se sta nel .text e non è stub → scrivi "internal"
+        # se è all'interno del .text -> funzione interna
         img_base = self.pe.OPTIONAL_HEADER.ImageBase
         for sec in self.pe.sections:
-            name = sec.Name.decode(errors='ignore').rstrip('\x00')
             start = img_base + sec.VirtualAddress
             end = start + max(sec.Misc_VirtualSize, sec.SizeOfRawData)
             if start <= target_abs < end:
+                name = sec.Name.decode(errors='ignore').rstrip('\x00')
                 if name == '.text':
                     return f"internal_0x{target_abs:X}"
         return f"unknown_0x{target_abs:X}"
 
     def try_resolve_indirect_call(self, call_ins, depth=80):
         """
-        Esteso:
-        - call [abs] -> se abs è IAT slot -> nome import
-        - call [reg+disp] -> se disp solo (base=0,index=0) usiamo disp come abs; altrimenti prova data-flow semplice
-        - call reg -> data-flow (mov/lea) e prova deref -> IAT
+        Tenta di risolvere una call indiretta (call reg / call [mem]) con euristiche:
+        - Scansione a ritroso fino a depth istruzioni per trovare mov/lea che impostano il registro coinvolto
+        - Dereferenziazione mem se possibile (read_memory_dword)
+        Ritorna stringa descrittiva (es. "KERNEL32.dll!LoadLibraryA") o etichette tipo "call_indiretta_non_risolta".
         """
         self.ensure_disassembled()
+        if not self._last_instructions or self._addr_to_index is None:
+            return "call_indiretta_non_risolta"
+
         op = call_ins.operands[0]
         idx = self._addr_to_index.get(call_ins.address, None)
         if idx is None:
             return "call_indiretta_non_risolta"
 
-        # MEM: call [something]
-        if op.type == capstone.x86.X86_OP_MEM:
-            try:
-                abs_mem_addr = self.get_mem_operand_abs_address(op)
-            except Exception:
+        # Caso call [mem]
+        if op.type == CS_OP_MEM:
+            # tentativo semplice: se mem.base/index == 0 -> mem.disp potrebbe essere VA (IAT slot)
+            mem = op.mem
+            if mem.base == 0 and mem.index == 0:
+                abs_mem = mem.disp
+                # se è uno slot IAT
+                if abs_mem in self.iat_slot_to_name:
+                    return self.iat_slot_to_name[abs_mem]
+                # dereferenzia [abs] -> ptr
+                ptr = self.read_memory_dword(abs_mem)
+                if ptr:
+                    if ptr in self.thunk_to_name:
+                        return self.thunk_to_name[ptr]
+                    if ptr in self.iat_slot_to_name:
+                        return self.iat_slot_to_name[ptr]
+                    return f"call_mem_indiretta_0x{ptr:X}_non_mappata"
                 return "call_indiretta_non_risolta"
-
-            # caso semplice: [abs] è proprio uno slot IAT
-            if hasattr(self, 'iat_slot_to_name') and abs_mem_addr in self.iat_slot_to_name:
-                return self.iat_slot_to_name[abs_mem_addr]
-
-            # caso: dereferenzia [abs] -> ptr; a volte in file punta a thunk/IAT
-            ptr = self.read_memory_dword(abs_mem_addr, 4)
+            # caso più generale: abbiamo bisogno di valori di registro -> ricostruisco reg_state locale
+            reg_state = {r: 0 for r in ['eax','ebx','ecx','edx','esi','edi','esp','ebp']}
+            for i in range(idx-1, max(idx-depth-1, -1), -1):
+                prev = self._last_instructions[i]
+                self._update_reg_state_for_instruction(prev, reg_state)
+            try:
+                abs_mem = self.get_mem_operand_abs_address(op, reg_state)
+            except Exception:
+                abs_mem = None
+            if abs_mem is None:
+                return "call_indiretta_non_risolta"
+            # dereferenzia
+            ptr = self.read_memory_dword(abs_mem)
             if ptr:
-                # se ptr è thunk
-                if hasattr(self, 'thunk_to_name') and ptr in self.thunk_to_name:
+                if ptr in self.thunk_to_name:
                     return self.thunk_to_name[ptr]
-                # se ptr è IAT slot (meno comune qui)
-                if hasattr(self, 'iat_slot_to_name') and ptr in self.iat_slot_to_name:
+                if ptr in self.iat_slot_to_name:
                     return self.iat_slot_to_name[ptr]
-                # fallback: non mappata ma stampo dove punta
                 return f"call_mem_indiretta_0x{ptr:X}_non_mappata"
-
             return "call_indiretta_non_risolta"
 
-        # REG: call eax (data-flow retro)
-        if op.type == capstone.x86.X86_OP_REG:
-            reg_name = self.md.reg_name(op.reg)
-            for i in range(idx - 1, max(idx - depth - 1, -1), -1):
+        # Caso call reg  (es. call eax)
+        if op.type == CS_OP_REG:
+            reg_name = self._reg_name(op.reg)
+            # scanning backward con stato locale dei registri
+            reg_state = {r: 0 for r in ['eax','ebx','ecx','edx','esi','edi','esp','ebp']}
+            for i in range(idx-1, max(idx-depth-1, -1), -1):
                 prev = self._last_instructions[i]
-                # aggiorna uno stato minimo dei registri
-                self.update_registers_from_instruction(prev)
+                # aggiorna reg_state (non globale)
+                self._update_reg_state_for_instruction(prev, reg_state)
 
-                # Prova pattern chiave
-                if prev.mnemonic == 'mov' and len(prev.operands) == 2:
+                # se trovi mov reg, imm
+                if prev.mnemonic == 'mov' and len(prev.operands) >= 2:
                     dst, src = prev.operands[0], prev.operands[1]
-                    if dst.type == capstone.x86.X86_OP_REG and self.md.reg_name(dst.reg) == reg_name:
+                    if dst.type == CS_OP_REG and self._reg_name(dst.reg) == reg_name:
                         # mov reg, imm
-                        if src.type == capstone.x86.X86_OP_IMM:
+                        if src.type == CS_OP_IMM:
                             imm = src.imm
-                            # imm può essere indirizzo di thunk
-                            if hasattr(self, 'thunk_to_name') and imm in self.thunk_to_name:
+                            # imm può essere indirizzo di thunk o IAT
+                            if imm in self.thunk_to_name:
                                 return self.thunk_to_name[imm]
-                            # imm può essere slot IAT (raro in mov reg, imm)
-                            if hasattr(self, 'iat_slot_to_name') and imm in self.iat_slot_to_name:
+                            if imm in self.iat_slot_to_name:
                                 return self.iat_slot_to_name[imm]
-                            # dereferenzia imm (es. puntatore a thunk/IAT)
-                            val = self.read_memory_dword(imm, 4)
+                            # prova dereferenzia imm (imm potrebbe essere VA puntatore)
+                            val = self.read_memory_dword(imm)
                             if val:
-                                if hasattr(self, 'thunk_to_name') and val in self.thunk_to_name:
+                                if val in self.thunk_to_name:
                                     return self.thunk_to_name[val]
-                                if hasattr(self, 'iat_slot_to_name') and val in self.iat_slot_to_name:
+                                if val in self.iat_slot_to_name:
                                     return self.iat_slot_to_name[val]
                                 return f"call_indiretta_0x{val:X}_non_mappata"
                         # mov reg, [mem]
-                        elif src.type == capstone.x86.X86_OP_MEM:
+                        if src.type == CS_OP_MEM:
                             try:
-                                mem_addr = self.get_mem_operand_abs_address(src)
+                                abs_mem = self.get_mem_operand_abs_address(src, reg_state)
                             except Exception:
-                                continue
-                            # [mem] è slot IAT?
-                            if hasattr(self, 'iat_slot_to_name') and mem_addr in self.iat_slot_to_name:
-                                return self.iat_slot_to_name[mem_addr]
-                            # altrimenti dereferenzia
-                            val = self.read_memory_dword(mem_addr, 4)
-                            if val:
-                                if hasattr(self, 'thunk_to_name') and val in self.thunk_to_name:
-                                    return self.thunk_to_name[val]
-                                if hasattr(self, 'iat_slot_to_name') and val in self.iat_slot_to_name:
-                                    return self.iat_slot_to_name[val]
-                                return f"call_mem_indiretta_0x{val:X}_non_mappata"
+                                abs_mem = None
+                            if abs_mem:
+                                # se abs_mem è slot IAT
+                                if abs_mem in self.iat_slot_to_name:
+                                    return self.iat_slot_to_name[abs_mem]
+                                val = self.read_memory_dword(abs_mem)
+                                if val:
+                                    if val in self.thunk_to_name:
+                                        return self.thunk_to_name[val]
+                                    if val in self.iat_slot_to_name:
+                                        return self.iat_slot_to_name[val]
+                                    return f"call_mem_indiretta_0x{val:X}_non_mappata"
 
-                # lea reg, [disp] → a volte puntatore a thunk
-                if prev.mnemonic == 'lea' and len(prev.operands) == 2:
+                # lea reg, [disp] pattern
+                if prev.mnemonic == 'lea' and len(prev.operands) >= 2:
                     dst, src = prev.operands[0], prev.operands[1]
-                    if dst.type == capstone.x86.X86_OP_REG and self.md.reg_name(
-                            dst.reg) == reg_name and src.type == capstone.x86.X86_OP_MEM:
+                    if dst.type == CS_OP_REG and self._reg_name(dst.reg) == reg_name and src.type == CS_OP_MEM:
                         mem = src.mem
                         if mem.base == 0 and mem.index == 0:
                             addr = mem.disp
-                            if hasattr(self, 'thunk_to_name') and addr in self.thunk_to_name:
+                            if addr in self.thunk_to_name:
                                 return self.thunk_to_name[addr]
-                            if hasattr(self, 'iat_slot_to_name') and addr in self.iat_slot_to_name:
+                            if addr in self.iat_slot_to_name:
                                 return self.iat_slot_to_name[addr]
-                            val = self.read_memory_dword(addr, 4)
+                            val = self.read_memory_dword(addr)
                             if val:
-                                if hasattr(self, 'thunk_to_name') and val in self.thunk_to_name:
+                                if val in self.thunk_to_name:
                                     return self.thunk_to_name[val]
-                                if hasattr(self, 'iat_slot_to_name') and val in self.iat_slot_to_name:
+                                if val in self.iat_slot_to_name:
                                     return self.iat_slot_to_name[val]
+                                return f"call_mem_indiretta_0x{val:X}_non_mappata"
             return "call_indiretta_non_risolta"
 
         return "call_indiretta_non_risolta"
 
-    # ----------------- API pubbliche richieste -----------------
-
-    def find_calls_to_functions(self, func_names):
-        """Ritorna [(indirizzo_call, nome_funzione | descrizione)]"""
+    # -----------------------------
+    # Interfaccia pubblica
+    # -----------------------------
+    def find_calls_to_functions(self, func_names=None):
+        """
+        Scansiona tutte le CALL nella sezione .text e prova a risolverle.
+        - func_names: None (tutte) oppure iterable di nomi da filtrare (sottostringhe cercate)
+        Ritorna lista di tuple (call_va, resolved_label).
+        """
         self.ensure_disassembled()
         self.build_full_import_maps()
 
         out = []
         for ins in self._last_instructions:
-            self.update_registers_from_instruction(ins)
-
+            # aggiorna run-time-sim (opzionale) non necessario qui
             if ins.mnemonic != 'call' or len(ins.operands) == 0:
                 continue
 
             op = ins.operands[0]
+            resolved = None
 
-            # CALL diretta (IMM)
-            if op.type == capstone.x86.X86_OP_IMM:
+            # call immediata
+            if op.type == CS_OP_IMM:
                 target = op.imm
-                label = self.resolve_direct_target(target)
-                out.append((ins.address, label))
-                continue
+                resolved = self.resolve_direct_target(target)
+            else:
+                resolved = self.try_resolve_indirect_call(ins)
 
-            # CALL indiretta
-            label = self.try_resolve_indirect_call(ins)
-            out.append((ins.address, label))
-
+            # filtraggio
+            if func_names is None:
+                out.append((ins.address, resolved))
+            else:
+                # func_names può essere list/set di nomi o sottostringhe
+                match = False
+                for pattern in func_names:
+                    if pattern is None:
+                        continue
+                    if isinstance(resolved, str) and pattern.lower() in resolved.lower():
+                        match = True
+                        break
+                if match:
+                    out.append((ins.address, resolved))
         return out
 
     def find_loadlibrary_getprocaddress_strings(self):
-        """Ritorna [(nome_funzione_chiamata, arg_stringa_o_<non trovata>)]"""
-        func_names = ['LoadLibraryA','LoadLibraryW','LoadLibraryExA','LoadLibraryExW','GetProcAddress']
-        calls = self.find_calls_to_functions(func_names)
-        self.ensure_disassembled()
+        """
+        Cerca chiamate LoadLibrary*/GetProcAddress e tenta di risalire al parametro stringa
+        Ritorna lista di tuple: (resolved_function_label, argument_string_or_<non trovata>)
+        """
+        # Chiamiamo find_calls_to_functions senza filtro per ottenere tutti i call risolti
+        calls = self.find_calls_to_functions()
         results = []
 
-        # mappa indirizzo call -> index istruzione per risalire ai push
-        for call_addr, func_or_desc in calls:
-            idx = self._addr_to_index.get(call_addr, None)
-            if idx is None:
-                results.append((func_or_desc, "<non trovata>"))
+        # per poter fare ricerca a ritroso, assicuriamoci del disassembly in cache
+        self.ensure_disassembled()
+
+        for call_va, resolved in calls:
+            # interessano solo LoadLibrary* e GetProcAddress
+            lowered = resolved.lower() if isinstance(resolved, str) else ''
+            if 'loadlibrary' not in lowered and 'getprocaddress' not in lowered:
                 continue
 
-            # cerchiamo un push immediato poco prima (euristica)
+            idx = self._addr_to_index.get(call_va)
             arg_str = None
-            for j in range(idx-1, max(idx-30, -1), -1):
-                prev = self._last_instructions[j]
-                self.update_registers_from_instruction(prev)
-                if prev.mnemonic == 'push' and len(prev.operands) == 1:
-                    op = prev.operands[0]
-                    if op.type == capstone.x86.X86_OP_IMM:
+
+            # scan a ritroso alla ricerca di push immediati / push [mem] / mov in registri
+            reg_state = {r: 0 for r in ['eax','ebx','ecx','edx','esi','edi','esp','ebp']}
+            # ricostruiamo lo stato su finestra ridotta per avere reg_state sensato
+            # (scandagliamo fino a 40 istruzioni indietro)
+            start = max(0, idx - 40)
+            for i in range(start, idx):
+                ins = self._last_instructions[i]
+                self._update_reg_state_for_instruction(ins, reg_state)
+
+            # ora cerchiamo PUSH subito prima della call (fino a 20 istruzioni)
+            for j in range(idx-1, max(idx-20, -1), -1):
+                ins = self._last_instructions[j]
+                # aggiornamento locale (utile se troviamo mov/pop)
+                # non modifichiamo reg_state qui per non cambiare il contesto precedente
+                if ins.mnemonic == 'push' and len(ins.operands) >= 1:
+                    op = ins.operands[0]
+                    if op.type == CS_OP_IMM:
                         imm = op.imm
-                        s = self.read_ascii_string_at(imm)
+                        s = self.read_best_string_at(imm)
                         if s:
                             arg_str = s
                             break
-                        # prova come RVA: imm - ImageBase
+                        # fallback: se imm sembra essere una RVA senza ImageBase, prova ad aggiungere ImageBase
                         maybe_abs = imm
-                        if not s:
-                            s = self.read_ascii_string_at(maybe_abs)
-                            if s:
-                                arg_str = s
-                                break
-                    elif op.type == capstone.x86.X86_OP_MEM:
+                        s2 = self.read_best_string_at(maybe_abs)
+                        if s2:
+                            arg_str = s2
+                            break
+                    elif op.type == CS_OP_MEM:
+                        # prova a calcolare abs con reg_state
                         try:
-                            abs_addr = self.get_mem_operand_abs_address(op)
-                            ptr = self.read_memory_dword(abs_addr, 4)
+                            mem_abs = self.get_mem_operand_abs_address(op, reg_state)
+                        except Exception:
+                            mem_abs = None
+                        if mem_abs:
+                            ptr = self.read_memory_dword(mem_abs)
                             if ptr:
-                                s = self.read_ascii_string_at(ptr)
+                                s = self.read_best_string_at(ptr)
                                 if s:
                                     arg_str = s
                                     break
-                        except Exception:
-                            pass
+                # alcuni programmi passano l'argomento in registri (es. stdcall con push mancante) -> cerca mov reg, imm pattern
+                if ins.mnemonic == 'mov' and len(ins.operands) >= 2:
+                    dst, src = ins.operands[0], ins.operands[1]
+                    # mov reg, imm e poi call reg (es. loadlibrary via register)
+                    if dst.type == CS_OP_REG and src.type == CS_OP_IMM:
+                        imm = src.imm
+                        s = self.read_best_string_at(imm)
+                        if s:
+                            arg_str = s
+                            break
 
-            results.append((func_or_desc, arg_str if arg_str else "<non trovata>"))
+            if not arg_str:
+                arg_str = "<non trovata>"
+
+            results.append((resolved, arg_str))
+
         return results

@@ -4,46 +4,63 @@ from dynamic_loader import DynamicLoaderAnalyzer
 
 
 
-def analyze_pe_recursive(pe_path, analyzed_files=None):
+def analyze_pe_recursive(pe_path, analyzed_files=None, depth=0):
+    """
+    Analizza un PE (exe o dll) e stampa le dipendenze ad albero.
+    """
     if analyzed_files is None:
         analyzed_files = set()
 
     abs_path = os.path.abspath(pe_path)
     if abs_path in analyzed_files:
         return
+
+    indent = "  " * depth
+    print(f"{indent}- {os.path.basename(abs_path)}")
     analyzed_files.add(abs_path)
 
-    print(f"\nAnalizzando: {abs_path}")
-    pe_an = PEAnalyzer(pe_path)
-    imported = pe_an.get_imported_apis()
-    print("API importate staticamente:")
-    for dll, func in imported:
-        print(f"  {dll} -> {func}")
+    try:
+        # Static imports
+        pe_analyzer = PEAnalyzer(pe_path)
+        imported = pe_analyzer.get_imported_apis()
+        if imported:
+            print(f"{indent}  [Import statici]:")
+            for dll, func in imported:
+                print(f"{indent}    {dll} -> {func}")
 
-    dyn = DynamicLoaderAnalyzer(pe_an.pe)
+        # Dynamic analysis
+        dyn_loader = DynamicLoaderAnalyzer(pe_analyzer.pe)
+        all_calls = dyn_loader.find_calls_to_functions()
+        if all_calls:
+            print(f"{indent}  [Chiamate dirette/indirette]:")
+            for addr, func in all_calls:
+                print(f"{indent}    0x{addr:X} -> {func}")
 
-    # 1) Chiamate LL/LLEx/GPA con argomenti
-    dyn_calls = dyn.find_loadlibrary_getprocaddress_strings()
-    print("\nChiamate dinamiche (con argomenti se trovati):")
-    for name, arg in dyn_calls:
-        print(f"  {name} -> {arg}")
+        # LoadLibrary / GetProcAddress
+        dynamic_calls = dyn_loader.find_loadlibrary_getprocaddress_strings()
+        dlls = [func for _, func in dynamic_calls if func.lower().startswith("loadlibrary")]
+        funcs = [func for _, func in dynamic_calls if func.lower().startswith("getprocaddress")]
 
-    # 2) Indirizzi chiamate a funzioni interessanti (debug + copertura indirette)
-    interesting = ['LoadLibraryA','LoadLibraryW','LoadLibraryExA','LoadLibraryExW','GetProcAddress']
-    calls = dyn.find_calls_to_functions(interesting)
-    print("\nMappa call a funzioni interessanti:")
-    for addr, label in calls:
-        print(f"  0x{addr:X} -> {label}")
+        if dlls:
+            print(f"{indent}  [Possibili DLL caricate dinamicamente]:")
+            for d in dlls:
+                print(f"{indent}    {d}")
+        if funcs:
+            print(f"{indent}  [Possibili funzioni risolte dinamicamente]:")
+            for f in funcs:
+                print(f"{indent}    {f}")
 
-    # Ricorsione: DLL passate a LoadLibrary*
-    base_dir = os.path.dirname(abs_path)
-    dlls = set(arg for (fn, arg) in dyn_calls if fn.startswith('LoadLibrary') and arg and arg != "<non trovata>")
-    for dll_name in dlls:
-        dll_path = os.path.join(base_dir, dll_name)
-        if os.path.isfile(dll_path):
-            analyze_pe_recursive(dll_path, analyzed_files)
-        else:
-            print(f"DLL non trovata localmente: {dll_name}")
+        # Ricorsione sulle DLL individuate
+        base_dir = os.path.dirname(abs_path)
+        for dll_name in dlls:
+            dll_path = os.path.join(base_dir, dll_name)
+            if os.path.isfile(dll_path):
+                analyze_pe_recursive(dll_path, analyzed_files, depth + 1)
+            else:
+                print(f"{indent}    [!] DLL non trovata localmente: {dll_name}")
+
+    except Exception as e:
+        print(f"{indent}  [ERRORE analisi: {e}]")
 
 
 if __name__ == "__main__":
