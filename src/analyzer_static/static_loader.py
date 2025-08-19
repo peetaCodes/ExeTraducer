@@ -1,5 +1,4 @@
-# dynamic_loader_enhanced.py
-# Versione estesa: gestione disp+ImageBase, follow thunk chains, vtable sensibile, diagnostics.
+# TODO: adjust this to be a static loader instead of just being the old re-named dynamic loader
 
 import pefile
 import capstone

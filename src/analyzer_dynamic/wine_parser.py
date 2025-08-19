@@ -128,7 +128,8 @@ class WineParser:
         )
         return exec_trace
 
-    def save_as_json(self, out_file: str, exec_trace: ExecutionTrace):
+    @staticmethod
+    def save_as_json(out_file: str, exec_trace: ExecutionTrace):
         with open(out_file, "w") as f:
             json.dump(asdict(exec_trace), f, indent=2)
 
