@@ -1,0 +1,10 @@
+|Argument                     |Descritpion                                                          | Bits (32/64) |
+___________________________________________________________________________________________________________________|
+|macos-aarch64                | Apple Silicon           -    ARM64     -      M1, M2, M3 [...] chips|      64      |
+|macos-x86_64                 | Intel/Intel-based macOS                                             |      64      |
+|                             |                                                                     |              |
+|                             |                                                                     |              |
+|linux-arm64                  | aarch64                 -    ARM64                                  |      64      |
+|linux-armv7                  | armhf                   -    ARM32     -      ARM                   |      32      |
+|linux-x86_64                 | Intel/AMD 64bit         -    i686                                   |      64      |
+|linux-x86                    | Intel/AMD 32bit         -    i386                                   |      32      |
