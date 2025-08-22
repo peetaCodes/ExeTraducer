@@ -1,381 +1,262 @@
 #!/usr/bin/env python3
 """
-callmap/binary_builder.py
+Create a runnable macOS (Apple Silicon) executable from a translated callmap JSON.
+This script is multi-target ready but currently implements only macOS (macos-aarch64).
 
-Input:
-  - compact_trace.json
-  - translation_plan.json
+Design and behaviour (conservative):
+ - Input: JSON file produced by your translator backend. Expected to be a LIST of call entries:
+     [ { "ir": "...", "action_type": "...", "json_repr": {...}, "code_c": "...", "code_objc": "...", "confidence": "...", "meta": {...} }, ... ]
+ - For each entry the script generates a C function stub `call_N()` that either embeds `code_c` if present,
+   or generates a safe stub that prints the json_repr. If `code_objc` exists it will be placed into an Objective-C .m file
+   compiled and linked with -framework Cocoa.
+ - The script produces a `main.c` that invokes each `call_N()` sequentially. It then compiles with clang for arm64.
+ - Output: a single executable (default ./out/app_macos_aarch64).
 
-Output (in out/project):
-  - trace.script        (line-based simplified trace)
-  - replayer.c          (interpreter main)
-  - wrappers.c          (implementazioni semplici delle API mappate)
-  - CMakeLists.txt
-  - (opzionale) build via cmake/make se --build
+Security notes / warnings:
+ - The script will embed and compile the `code_c` and `code_objc` snippets taken from the JSON.
+   You MUST review or run this only on trusted data. Generated code may call system(), open files, kill processes, etc.
+ - The script does not sandbox produced binaries. Use VMs or test machines for execution.
 
-Nota: il replayer non esegue il codice originale, interpreta la sequenza di chiamate
-      e invoca wrapper POSIX/macOS per le API mappate (ReadFile/WriteFile/CreateFile/CloseHandle/LoadLibrary/GetProcAddress).
+Requirements (to build locally on macOS):
+ - Xcode toolchain / clang available in PATH
+ - For GUI/ObjC snippets, compilation uses -framework Cocoa and .m files
+
+Usage:
+    python build_binary.py --callmap translated_calls.json --out ./out/app_macos_aarch64 --target macos-aarch64 --workdir ./build_artifacts
+
 """
-import os
-import json
+
+from __future__ import annotations
 import argparse
+import json
+import shutil
+import subprocess
+import sys
+from os.path import abspath
 from pathlib import Path
-from collections import Counter
+from typing import Any, Dict, List
 
-# ---------- helpers ----------
-def load_json(path):
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+from src.tools.universal_translation_utils import MAIN_HEADER, C_STUB_WRAPPER, clean_dictionary
 
-def tally_compact(compact):
-    cnt = Counter()
-    for th in compact.get("threads", []):
-        for c in th.get("calls", []):
-            key = f"{c['module'].upper()}!{c['function']}"
-            cnt[key] += 1
-    return cnt
 
-def check_plan_vs_trace(plan, compact_counts):
-    mismatches = []
-    for item in plan.get("plan", []):
-        key = item["win_api"]
-        plan_count = item.get("count", 0)
-        trace_count = compact_counts.get(key, 0)
-        if plan_count != trace_count:
-            mismatches.append((key, plan_count, trace_count))
-    return mismatches
+# Utility
+def safe_ident(n: str) -> str:
+    # Create a safe C identifier from an index or name
+    s = "".join(c if c.isalnum() or c == '_' else '_' for c in str(n))
+    if s and s[0].isdigit():
+        s = "_" + s
+    return s
 
-# ---------- produce script ----------
-def make_trace_script(compact, out_script_path):
+
+# Default compile/link flags for macOS Apple Silicon
+MACOS_CFLAGS = ["-std=c11", "-arch", "arm64", "-O2", "-fPIC"]
+MACOS_LDFLAGS = ["-arch", "arm64"]
+
+
+def render_c_safe_snippet(code_c: str, indent: int = 4) -> str:
+    if not code_c:
+        return " " * indent + '// (no C snippet provided)\\n' + " " * indent + 'printf("call stub (no-op)\\n");\\n'
+    # ensure code ends with newline
+    if not code_c.endswith("\n"):
+        code_c = code_c + "\n"
+    # indent each line properly
+    ind = " " * indent
+    safe_lines = []
+    for line in code_c.splitlines():
+        safe_lines.append(ind + line)
+    return "\n".join(safe_lines) + "\n"
+
+
+def ensure_tool_exists(tool: str) -> bool:
+    return shutil.which(tool) is not None
+
+
+def compile_macos(output_path: Path, sources: List[Path], extra_objc: List[Path], cflags: List[str] = None,
+                  ldflags: List[str] = None) -> tuple[int, str]:
+    # Build the clang command for macOS arm64
+    clang = shutil.which("clang") or shutil.which("clang++")
+    if clang is None:
+        return 2, ''
+    cflags = cflags or []
+    ldflags = ldflags or []
+
+    # compile each source to object
+    objs = []
+    for src in sources:
+        obj = src.with_suffix(".o")
+        cmd = [clang, "-c", str(src), "-o", str(obj)] + cflags
+        print("CC:", " ".join(cmd))
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return 3, f"Compilation failed for '{src}'. stderr: {proc.stderr}"
+        objs.append(obj)
+    # compile ObjC sources if present (clang compiles .m too)
+    for objc in extra_objc:
+        obj = objc.with_suffix(".o")
+        cmd = [clang, "-c", str(objc), "-o", str(obj)] + cflags + ["-ObjC", "-fobjc-arc"]
+        print("CC (ObjC):", " ".join(cmd))
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return 4, f"ObjC compilation failed for '{objc}'. stderr: proc.stderr"
+        objs.append(obj)
+    # link
+    out = str(output_path / "compiled")
+    link_cmd = [clang] + [str(o) for o in objs] + ["-o", out] + ldflags + ["-framework", "Cocoa"]
+    print("LD:", " ".join(link_cmd))
+    proc = subprocess.run(link_cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return 5, f"Link failed stderr: {proc.stderr}"
+    return 0, ''
+
+
+def generate_sources_from_callmap(callmap: List[Dict[str, Any]], workdir: Path) -> Dict[str, Any]:
     """
-    Trace script format (one call per line):
-      MODULE!Function|retval|arg0,arg1,arg2,...
-    where each arg is 'null' or a decimal integer.
+    Create C & ObjC source files in workdir based on callmap entries.
+    Returns a dict with lists of generated source paths and the list of function names.
     """
-    with open(out_script_path, 'w', encoding='utf-8') as f:
-        for th in compact.get("threads", []):
-            tid = th.get("tid")
-            for c in th.get("calls", []):
-                key = f"{c['module'].upper()}!{c['function']}"
-                retval = c.get("retval", "")
-                if retval is None:
-                    retval = ""
-                args = []
-                for a in c.get("args", []):
-                    v = a.get("value")
-                    if v is None:
-                        args.append("null")
-                    else:
-                        # store integers (handles/pointers) as decimal
-                        args.append(str(v))
-                line = f"{key}|{retval}|{','.join(args)}\n"
-                f.write(line)
+    workdir.mkdir(parents=True, exist_ok=True)
+    objc_file = workdir / "generated_calls.m"
+    header_file = workdir / "generated_calls.h"
 
-# ---------- generate wrappers.c and replayer.c ----------
-WRAPPERS_C = r'''// wrappers.c - minimal wrappers used by the replayer
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+    func_calls = []  # In the main
+    c_bodies = []  # In the generated_calls.c
+    objc_decls = []
+    objc_bodies = []
 
-// Simple mapping from win-handle (uint64) -> POSIX fd
-typedef unsigned long long win_handle_t;
-#define MAX_MAP 65536
+    # We will produce a simple header forward declarations for both C and ObjC functions
+    for idx, entry in enumerate(callmap):  # will end up in the header file
+        fn = f"call_{idx}"
+        func_calls.append(f"    {fn}();")
+        # prefer C snippet if available
+        code_c = entry.get("code_c")
+        code_objc = entry.get("code_objc")
 
-struct handle_entry {
-    win_handle_t wh;
-    int fd;
-};
+        if code_c and isinstance(code_c, str) and code_c.strip():
+            body = render_c_safe_snippet(code_c, indent=4)
+            c_bodies.append(C_STUB_WRAPPER.format(fn_name=fn, body=body))
 
-static struct handle_entry handle_map[MAX_MAP];
-static int handle_map_count = 0;
+        elif code_objc and isinstance(code_objc, str) and code_objc.strip():
+            # create a tiny C wrapper that calls an ObjC function implemented in .m
+            objc_fn = f"{fn}_objc_impl"
 
-static void map_set(win_handle_t wh, int fd) {
-    for (int i=0;i<handle_map_count;i++){
-        if (handle_map[i].wh == wh) { handle_map[i].fd = fd; return; }
-    }
-    if (handle_map_count < MAX_MAP) {
-        handle_map[handle_map_count].wh = wh;
-        handle_map[handle_map_count].fd = fd;
-        handle_map_count++;
-    }
-}
-static int map_get(win_handle_t wh) {
-    for (int i=0;i<handle_map_count;i++){
-        if (handle_map[i].wh == wh) return handle_map[i].fd;
-    }
-    return -1;
-}
-static void map_unset(win_handle_t wh){
-    for (int i=0;i<handle_map_count;i++){
-        if (handle_map[i].wh == wh) {
-            // remove by swap
-            handle_map[i] = handle_map[handle_map_count-1];
-            handle_map_count--;
-            return;
-        }
-    }
-}
+            # Forward-declare the ObjC bridge function in C and declare wrapper
+            c_body = f'    // Bridge to ObjC implementation\n    extern void {objc_fn}(void);\n    {objc_fn}();\n'
+            c_bodies.append(C_STUB_WRAPPER.format(fn_name=fn, body=c_body))
 
-// Implementazione rudimentale di CreateFile* -> open()
-// Per path non fornito nel trace, crea un temp file basato sul handle value.
-win_handle_t win_CreateFile_stub(unsigned long long retval_hint) {
-    // create a temp file named /tmp/translated_<retval_hint>
-    char path[256];
-    snprintf(path, sizeof(path), "/tmp/translated_%llu.bin", retval_hint);
-    int fd = open(path, O_RDWR | O_CREAT, 0600);
-    if (fd < 0) {
-        perror("open");
-        return 0;
-    }
-    map_set((win_handle_t)retval_hint, fd);
-    return (win_handle_t)retval_hint;
-}
+            # Add Objective-C implementation
+            objc_impl = '\n'.join([line for line in (code_objc.splitlines())])
+            objc_body = f'void {objc_fn}(void) {{\n{objc_impl}\n}}\n'
+            objc_bodies.append(objc_body)
+            objc_decls.append(f"void {objc_fn}(void)" + "{};")
 
-int win_CloseHandle_stub(unsigned long long wh) {
-    int fd = map_get((win_handle_t)wh);
-    if (fd >= 0) {
-        close(fd);
-        map_unset((win_handle_t)wh);
-        return 1; // success
-    }
-    return 0; // fail
-}
+        else:
+            # fallback: print the json_repr; safe stub
+            ir_label = str(entry.get("ir", "(no-ir)"))
+            dll_label = str(entry.get("dll", "(no-dll)"))
+            func_label = str(entry.get("func", "(no-func)"))
+            conf_label = str(entry.get("confidence", "unknown"))
+            jr = entry.get("json_repr") or entry.get("params") or entry.get("action_type") or {}
+            jr_s = json.dumps(jr, ensure_ascii=False)
 
-// ReadFile(handle, buf, count, out_read, overlapped)
-int win_ReadFile_stub(unsigned long long wh, unsigned long long buf_ptr, unsigned long long count) {
-    int fd = map_get((win_handle_t)wh);
-    if (fd < 0) return 0;
-    // simulate read: read into temp buffer and discard
-    size_t toread = (size_t)count;
-    // allocate but avoid huge allocations
-    size_t chunk = toread;
-    if (chunk > 65536) chunk = 65536;
-    char *tmp = malloc(chunk);
-    if (!tmp) return 0;
-    ssize_t total = 0;
-    size_t remaining = toread;
-    while (remaining) {
-        size_t now = (remaining > chunk) ? chunk : remaining;
-        ssize_t r = read(fd, tmp, now);
-        if (r <= 0) break;
-        total += r;
-        remaining -= (size_t)r;
-    }
-    free(tmp);
-    // return 1 for success (as Windows returns nonzero true)
-    return total > 0 ? 1 : 0;
-}
+            body = (
+                f'    printf("CALL {idx}: IR={ir_label} DLL={dll_label} FUNC={func_label} CONF={conf_label}\\n");\n'
+                f'    printf("  json: {clean_dictionary(jr_s)}\\n");\n'
+            )
+            c_bodies.append(C_STUB_WRAPPER.format(fn_name=fn, body=body))
 
-// WriteFile(handle, buf, count, out_written, overlapped)
-int win_WriteFile_stub(unsigned long long wh, unsigned long long buf_ptr, unsigned long long count) {
-    int fd = map_get((win_handle_t)wh);
-    if (fd < 0) return 0;
-    // we don't have original buffer contents, so write zero bytes to simulate
-    size_t towrite = (size_t)count;
-    size_t chunk = towrite;
-    if (chunk > 65536) chunk = 65536;
-    char *tmp = calloc(1, chunk);
-    if (!tmp) return 0;
-    ssize_t total = 0;
-    size_t remaining = towrite;
-    while (remaining) {
-        size_t now = (remaining > chunk) ? chunk : remaining;
-        ssize_t w = write(fd, tmp, now);
-        if (w <= 0) break;
-        total += w;
-        remaining -= (size_t)w;
-    }
-    free(tmp);
-    return total == (ssize_t)towrite ? 1 : 0;
-}
-
-// LoadLibrary -> stub (returns the retval_hint as handle)
-unsigned long long win_LoadLibrary_stub(unsigned long long retval_hint) {
-    // we don't know the DLL path here; just return the same handle id
-    return retval_hint;
-}
-
-// GetProcAddress -> stub (returns the retval hint back)
-unsigned long long win_GetProcAddress_stub(unsigned long long retval_hint) {
-    return retval_hint;
-}
-'''
-
-REPLAYER_C = r'''// replayer.c - read trace.script and call wrappers
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-
-extern unsigned long long win_CreateFile_stub(unsigned long long retval_hint);
-extern int win_CloseHandle_stub(unsigned long long wh);
-extern int win_ReadFile_stub(unsigned long long wh, unsigned long long buf_ptr, unsigned long long count);
-extern int win_WriteFile_stub(unsigned long long wh, unsigned long long buf_ptr, unsigned long long count);
-extern unsigned long long win_LoadLibrary_stub(unsigned long long retval_hint);
-extern unsigned long long win_GetProcAddress_stub(unsigned long long retval_hint);
-
-static void trim_newline(char *s) {
-    size_t L = strlen(s);
-    while (L>0 && (s[L-1]=='\n' || s[L-1]=='\r')) { s[L-1]=0; L--; }
-}
-
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s trace.script\n", argv[0]);
-        return 2;
-    }
-    const char *tracefile = argv[1];
-    FILE *f = fopen(tracefile, "r");
-    if (!f) { perror("fopen"); return 3; }
-
-    char *line = NULL;
-    size_t len = 0;
-    ssize_t readl;
-    unsigned long long lineno = 0;
-    while ((readl = getline(&line, &len, f)) != -1) {
-        lineno++;
-        trim_newline(line);
-        if (line[0] == 0) continue;
-        // format: MODULE!Func|retval|arg0,arg1,...
-        char *p1 = strchr(line, '|');
-        if (!p1) continue;
-        *p1 = 0;
-        char *api = line; // MODULE!Func
-        char *p2 = p1 + 1;
-        char *p3 = strchr(p2, '|');
-        char *retval_s = NULL;
-        char *args_s = NULL;
-        if (p3) {
-            *p3 = 0;
-            retval_s = p2;
-            args_s = p3 + 1;
-        } else {
-            retval_s = p2;
-            args_s = "";
-        }
-        unsigned long long retval = 0;
-        if (retval_s && retval_s[0]) retval = strtoull(retval_s, NULL, 10);
-
-        // parse args
-        unsigned long long args[8];
-        int nargs = 0;
-        if (args_s && args_s[0]) {
-            char *tok = strtok(args_s, ",");
-            while (tok && nargs < 8) {
-                if (strcmp(tok, "null")==0) args[nargs++] = 0;
-                else args[nargs++] = strtoull(tok, NULL, 10);
-                tok = strtok(NULL, ",");
-            }
-        }
-
-        // dispatch on api
-        if (strcmp(api, "KERNEL32!CreateFileW")==0 || strcmp(api, "KERNEL32!CreateFileA")==0) {
-            win_CreateFile_stub(retval);
-        } else if (strcmp(api, "KERNEL32!CloseHandle")==0) {
-            unsigned long long h = (nargs>0) ? args[0] : retval;
-            win_CloseHandle_stub(h);
-        } else if (strcmp(api, "KERNEL32!ReadFile")==0) {
-            unsigned long long h = (nargs>0) ? args[0] : 0;
-            unsigned long long buf = (nargs>1) ? args[1] : 0;
-            unsigned long long cnt = (nargs>2) ? args[2] : 0;
-            win_ReadFile_stub(h, buf, cnt);
-        } else if (strcmp(api, "KERNEL32!WriteFile")==0) {
-            unsigned long long h = (nargs>0) ? args[0] : 0;
-            unsigned long long buf = (nargs>1) ? args[1] : 0;
-            unsigned long long cnt = (nargs>2) ? args[2] : 0;
-            win_WriteFile_stub(h, buf, cnt);
-        } else if (strcmp(api, "KERNEL32!LoadLibraryA")==0 || strcmp(api, "KERNEL32!LoadLibraryW")==0 || strcmp(api, "KERNEL32!LoadLibraryExW")==0 || strcmp(api, "KERNEL32!LoadLibraryExA")==0) {
-            win_LoadLibrary_stub(retval);
-        } else if (strcmp(api, "KERNEL32!GetProcAddress")==0) {
-            win_GetProcAddress_stub(retval);
-        } else {
-            // unmapped: just log
-            fprintf(stderr, "[replayer] unmapped api %s (line %llu)\\n", api, lineno);
-        }
-    }
-
-    free(line);
-    fclose(f);
-    return 0;
-}
-'''
-
-CMAKETXT = r'''cmake_minimum_required(VERSION 3.15)
-project(translated_replayer C)
-
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_OSX_ARCHITECTURES "arm64")
-set(SOURCES
-    replayer.c
-    wrappers.c
-)
-
-add_executable(translated_replayer ${SOURCES})
-target_link_libraries(translated_replayer
-    "-framework CoreFoundation"  # if needed for wide-string impl later
-)
-'''
-
-# ---------- main builder ----------
-def build_project(compact_path, plan_path, out_dir, auto_build=False):
-    compact = load_json(compact_path)
-    plan = load_json(plan_path)
-
-    # verify expected structure
-    if "threads" not in compact:
-        raise RuntimeError("compact_trace.json missing 'threads' key")
-    if "plan" not in plan:
-        raise RuntimeError("translation_plan.json missing 'plan' key")
-
-    # tally and compare
-    compact_counts = tally_compact(compact)
-    mismatches = check_plan_vs_trace(plan, compact_counts)
-
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    trace_script = Path(out_dir) / "trace.script"
-    make_trace_script(compact, trace_script)
-
-    # write source files
-    (Path(out_dir) / "wrappers.c").write_text(WRAPPERS_C)
-    (Path(out_dir) / "replayer.c").write_text(REPLAYER_C)
-    (Path(out_dir) / "CMakeLists.txt").write_text(CMAKETXT)
-
-    # report
-    print(f"[+] Project generated in {out_dir}")
-    print(f"    - trace script: {trace_script}")
-    print("    - sources: replayer.c, wrappers.c, CMakeLists.txt")
-
-    if mismatches:
-        print("[!] MISMATCHES between translation_plan counts and compact_trace:")
-        for k, pcount, tcount in mismatches:
-            print(f"    - {k}: plan={pcount}, trace={tcount}")
+    # Write ObjC file if needed
+    if objc_bodies:
+        with open(objc_file, "w", encoding="utf-8") as of:
+            # Objective-C file header
+            of.write('#import <Foundation/Foundation.h>\n#import <Cocoa/Cocoa.h>\n')
+            for b in objc_bodies:
+                of.write(b + "\n")
     else:
-        print("[+] translation_plan counts match compact_trace tallies for listed APIs.")
+        objc_file = None
 
-    if auto_build:
-        # try to run cmake & make (only on macOS with cmake available)
-        cur = os.getcwd()
-        try:
-            os.chdir(out_dir)
-            print("[*] Running cmake...")
-            os.system("cmake .")
-            print("[*] Running make...")
-            os.system("make -j4")
-            print("[+] Build finished (if tools present).")
-        finally:
-            os.chdir(cur)
+    return {
+        'c_bodies': c_bodies,
+        'objc_file': objc_file,
+        'header_file': header_file,
+        'func_calls': func_calls,
+        'count': len(callmap)
+    }
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build a macOS replayer project from compact_trace + translation_plan")
-    parser.add_argument("compact_trace", help="compact_trace.json")
-    parser.add_argument("translation_plan", help="translation_plan.json")
-    parser.add_argument("--out", default="out/project", help="output project dir")
-    parser.add_argument("--build", action="store_true", help="run cmake && make after generation (if available)")
-    args = parser.parse_args()
 
-    build_project(args.compact_trace, args.translation_plan, args.out, auto_build=args.build)
+def build_main_and_compile(sources_info: Dict[str, Any], out_path: Path, workdir: Path) -> tuple[int, str]:
+    # create main.c using decls and calls
+    calls = "\n".join(sources_info['func_calls'])
+    bodies = "\n".join(sources_info['c_bodies'])
+    main_c = workdir / 'main.c'
+    with open(main_c, 'w', encoding='utf-8') as mf:
+        mf.write(MAIN_HEADER.format(funcs=bodies, calls=calls))
+    # prepare compile lists
+    objc_sources = []
+    if sources_info.get('objc_file'):
+        objc_sources.append(sources_info['objc_file'])
+    # compile
+    code, message = compile_macos(out_path, [main_c], objc_sources, cflags=MACOS_CFLAGS, ldflags=MACOS_LDFLAGS)
+    return code, message
+
+
+def load_callmap(path: Path) -> List[Dict[str, Any]]:
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    # Expecting list; if dict with 'callmap' key, support it
+    if isinstance(data, dict) and 'callmap' in data:
+        return data['callmap']
+    if isinstance(data, list):
+        return data
+    raise RuntimeError('Unexpected JSON layout: expected list of call entries or {callmap: [...] }')
+
+
+def generate_code(callmap: str, workdir: str):
+    callmap_path = Path(callmap)
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    # Load callmap
+    try:
+        callmap = load_callmap(callmap_path)
+    except Exception as e:
+        print('Failed to load callmap:', e, file=sys.stderr);
+        return 10
+
+    # Generate sources
+    print(f'Generating C/ObjC sources in {workdir} for {len(callmap)} entries...')
+    src_info = generate_sources_from_callmap(callmap, workdir)
+    print('Generated:', src_info)
+    return src_info
+
+
+def build_exec(output_path: str, workdir: str, src_info, target: str, clang: str) -> tuple[int, str]:
+    out_path = Path(output_path)
+
+    # Build for macOS arm64
+    if target == 'macos-aarch64':
+        # check clang exists
+        if not ensure_tool_exists(clang):
+            return 20, f"Clang not found at '{clang}' or in PATH. Please install Xcode command line tools."
+        rc, message = build_main_and_compile(src_info, out_path, workdir)
+        if rc != 0:
+            print('Build failed with code', rc, file=sys.stderr)
+            return rc, message
+        print('Build succeeded. Executable at:', out_path)
+        return 0, ''
+    else:
+        return 30, f"Target not implemented yet: {target}"
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Build an executable from translated callmap JSON (macOS arm64 implementation)')
+    parser.add_argument('--callmap', '-c', required=True, help='Path to translated callmap JSON (list of entries)')
+    parser.add_argument('--out', '-o', default='./out/app_macos_aarch64', help='Output executable path')
+    parser.add_argument('--workdir', '-w', default='./build_artifacts',
+                        help='Temporary working folder (will be created)')
+    parser.add_argument('--target', '-t', default='macos-aarch64', choices=['macos-aarch64'],
+                        help='Target platform (currently only macos-aarch64 implemented)')
+    parser.add_argument('--clang', default='clang', help='Path to clang if not in PATH')
+    args = parser.parse_args(sys.argv[1:])
+
+    sys.exit(generate_code(args.callmap, args.out, args.workdir, args.target, args.clang))

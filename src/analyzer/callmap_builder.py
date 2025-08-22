@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+# pe_callmap_static_v2.py
+# TODO: re-make all of this as it is unreliable and just SUCKS
 """
-pe_callmap_static_v2.py
 Enhanced prototyping tool for static PE callmap extraction (x86/x64).
 Features added compared to earlier prototype:
  - automatic UTF-16 (wide) string extraction across the image
@@ -23,10 +24,10 @@ Dependencies:
 Usage:
   python pe_callmap_static_v2.py <path-to-pe> [--out callmap.json] [--min-wide 4] [--min-ascii 4]
 
-Author: ChatGPT (prototype)
+Author: prototype mostly by chatGPT; final version (mostly patches) by me
 """
 
-from analyzer_static.snippet_emulator import emulate_snippet
+from src.analyzer.snippet_emulator import emulate_snippet
 
 import os, json, argparse, struct
 import pefile
@@ -723,9 +724,9 @@ def find_getproc_and_resolve(insns, pe, arch, imap, ascii_strings, wide_strings)
     return results
 
 class PEAnalyzer:
-    def __init__(self, verbose:bool=False, log:bool=False, log_dir:bool="../reports/pe_analyzer_logs/"):
+    def __init__(self, verbose: bool = False, log: bool = False, log_dir: bool = "/reports/pe_analyzer_logs/"):
         self.DEBUG_MODE = verbose
-        if log: self.LOG_FILE = merge(log_dir, f'pe_callmap_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log')
+        self.LOG_FILE = merge(log_dir, f'pe_callmap_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log') if log else None
 
     # ---------- Main analysis flow ----------
     def analyze_pe(
@@ -851,6 +852,7 @@ class PEAnalyzer:
                 }
 
                 if allow_emulation:
+                    self.dbp("MAY EMULATE")
                     # If we're not much confident and/or suspicious about GetProcAddress' sh..tuff; emulate it
                     if entry["func"].lower() == "getprocaddress" and entry["args"]:
                         target_arg = entry["args"][1] if len(entry["args"]) > 1 else None
@@ -941,19 +943,20 @@ def main():
     parser = argparse.ArgumentParser(description="Static PE callmap extractor (x86/x64)")
     parser.add_argument("pe", help="Path to PE (exe/dll)")
     parser.add_argument("--out", help="Output JSON path", default="callmap.json")
-    parser.add_argument("--log-dir", help="The folder in which to store the logs", default="../reports/pe_analyzer_logs/")
+    parser.add_argument("--log-dir", help="The folder in which to store the logs", default="/reports/pe_analyzer_logs/")
     parser.add_argument("--min-wide", type=int, default=4, help="Minimum UTF-16 wide string length")
     parser.add_argument("--min-ascii", type=int, default=4, help="Minimum ASCII string length")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--allow-emulation", action="store_true", help="""If passed it will allow the program to emulate part of the PE if the confidence is low.
-Emulating may create un-trusty results, but it's likely that it will actually improve the final result;
-as it will (try to) re-create parts of the PE that couldn't be understood.
-The program will still prefer to not emulate when possible, even if --allow-emulation is passed.""")
+    Emulating may create un-trusty results, but it's likely that it will actually improve the final result;
+    as it will (try to) re-create parts of the PE that couldn't be understood.
+    The program will still prefer to not emulate when possible, even if --allow-emulation is passed.""")
     parser.add_argument("--log", action="store_true", help="If passed the script will create a log inf the --log-dir directory")
     args = parser.parse_args()
 
     pe_analyzer = PEAnalyzer(verbose=args.verbose, log=args.log, log_dir=args.log_dir)
-    pe_analyzer.analyze_pe(args.pe, out_json=args.out, min_wide=args.min_wide, min_ascii=args.min_ascii)
+    pe_analyzer.analyze_pe(args.pe, out_json=args.out, min_wide=args.min_wide, min_ascii=args.min_ascii,
+                           allow_emulation=args.allow_emulation)
 
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()
