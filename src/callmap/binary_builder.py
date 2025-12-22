@@ -225,7 +225,6 @@ def generate_code(callmap: str, workdir: str):
     # Generate sources
     print(f'Generating C/ObjC sources in {workdir} for {len(callmap)} entries...')
     src_info = generate_sources_from_callmap(callmap, workdir)
-    print('Generated:', src_info)
     return src_info
 
 

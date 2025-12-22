@@ -1,4 +1,3 @@
-# backend_translator.py
 # Minimal backend translator: convert callmap entries -> target-specific IR / simple shim.
 import json, os, shlex
 from typing import List, Dict, Any, Optional
@@ -101,7 +100,6 @@ class BackendTranslator:
                 translated = map_ir_to_macos(call_entry)
 
         params = map_createfile_args(call_entry.get("args", []))
-        print(f"Translated {call_name} into {self.target} with {translated['confidence'].upper()} confidence")
         return {f"{self.target}": translated["ir"], "params": params, "meta": call_entry}
 
     def translate_callmap(self, callmap: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

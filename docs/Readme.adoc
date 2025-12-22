@@ -1,0 +1,39 @@
+= Cosa sto combinando?
+
+== Motivazione
+
+Ho deciso di creare questo programma perché...
+
+== Come funziona
+
+[plantuml,aligne="center",format="svg"]
+----
+!pragma layout smetana
+
+component [CLI] as cli
+rectangle Pipeline {
+component [Analyzer] as analyzer
+component [Translator] as translator1
+component [Translator] as translator2
+component [Binary builder] as build1
+component [Binary builder] as build2
+}
+
+cli --> analyzer
+analyzer --> translator1
+translator1 --> translator2
+translator2 --> build1
+build1 --> build2
+
+note right of cli
+Entry point
+endnote
+
+note right of analyzer
+Looks into the PE's binary
+and build a callmap
+endnote
+
+----
+
+== Conclusione

@@ -14,9 +14,9 @@ from pathlib import Path
 from types import TracebackType as Traceback
 from traceback import print_tb, print_exception
 
-from json import loads
+from json import loads, dumps
 
-from analyzer.callmap_builder import PEAnalyzer
+from analyzer.callmap_builder import PECallResolver
 from callmap.translator import BackendTranslator
 from callmap.binary_builder import generate_code, build_exec
 
@@ -28,7 +28,9 @@ def ExeTraducerExceptionHandler(e_type: Exception, value, traceback: Traceback):
     if is_custom:
         print_exception(e_type, value, None, file=sys.stderr, colorize=True)
     else:
-        sys.excepthook(e_type, value, traceback)
+        print_tb(traceback, file=sys.stdout)
+        print("[ERROR] Pipeline failed because of", end=" ", file=sys.stderr)
+        print_exception(e_type, value, None, file=sys.stderr, colorize=True)
 
 # Custom exception
 class ExeTraducerError(Exception):
@@ -52,8 +54,6 @@ def run_pipeline(
         clang_path: str,
     verbose: bool = False,
         log: bool = False,
-    min_wide: int = 4,
-    min_ascii: int = 4,
     allow_emulation: bool = False,
     force: bool = False,
     build: bool = False
@@ -83,18 +83,13 @@ def run_pipeline(
     total_ops: int = int(build) + 4
 
     # 1) Build the callmap by analyzing the PE
-    # """
-    print(f"[1/{total_ops}] Creating callmap")
-    pe_analyzer = PEAnalyzer(verbose=verbose, log=log, log_dir=pe_callmap_logs_dir)
-    status = pe_analyzer.analyze_pe(exe_path, out_json=callmap_path, min_wide=min_wide, min_ascii=min_ascii, allow_emulation=allow_emulation, force=force)
-    if status == 0:
-        print(f"    -> file: {callmap_path}");print(f"    -> log: {pe_analyzer.LOG_FILE}")
-    else:
-        raise ExeTraducerError(f"File '{FILE_ERROR_CODES[status][0]}' already exists at '{FILE_ERROR_CODES[status][1]}'. Use --force to overwrite the file in the next execution",status)
-    # """
+    print(f"[1/{total_ops}] Creating callmap", file=sys.stderr)
+    resolver = PECallResolver(exe_path, max_dyn_ms=120000)
+    callmap = resolver.run()
+    callmap_path.write_text(dumps(callmap, indent=2))
 
     # 2) Translate callmap file into IR (intermediate language)
-    print(f"[2/{total_ops}] Translating the callmap into IR (intermediate language)")
+    print(f"[2/{total_ops}] Translating the callmap into IR (intermediate language)", file=sys.stderr)
     translator = BackendTranslator("IR")
     translated = translator.translate_callmap(callmap=loads(callmap_path.read_text('utf-8')))
     translator.emit_json(translated, IR_callmap_path)
@@ -102,7 +97,7 @@ def run_pipeline(
     print(f"    -> file: {IR_callmap_path}")
 
     # 3) Translate the IR callmap into the target system
-    print(f"[3/{total_ops}] Translating the callmap into the target system")
+    print(f"[3/{total_ops}] Translating the callmap into the target system", file=sys.stderr)
     translator = BackendTranslator(system)
     translated = translator.translate_callmap(callmap=translated)
     translator.emit_json(translated, target_system_callmap_path)
@@ -110,12 +105,12 @@ def run_pipeline(
     print(f"    -> file: {target_system_callmap_path}")
 
     # 4) Making source code to simulate the obtained callmap
-    print(f"[4/{total_ops}] Writing source code that replicates the translated callmap")
+    print(f"[4/{total_ops}] Writing source code that replicates the translated callmap", file=sys.stderr)
     src_info = generate_code(target_system_callmap_path, workdir=code_dir)
 
     # 5) Building the binary
     if build:
-        print(f"[5/{total_ops}] Compiling the executable")
+        print(f"[5/{total_ops}] Compiling the executable", file=sys.stderr)
         status, message = build_exec(output_path=project_out, workdir=code_dir, src_info=src_info, target=system,
                                      clang=clang_path)
         if status != 0: raise ExeTraducerError(message, status)
@@ -132,13 +127,8 @@ def main(argv):
     Intermediate JSON archives AND logs path. Any of the files in this folder can be deleted after execution", default="/reports/""")
     parser.add_argument("-project-out", default="../out/project", help="""Converted .exe path""")
     parser.add_argument('--clang', default='clang', help="""Path to clang if not in PATH""")
-    parser.add_argument("-min-wide", type=int, default=4, help="""Minimum UTF-16 wide string length""")
-    parser.add_argument("-min-ascii", type=int, default=4, help="""Minimum ASCII string length""")
     parser.add_argument("--verbose", action="store_true", help="""Enable consol output""")
-    parser.add_argument("--allow-emulation", action="store_true", help="""If passed it will allow the program to emulate part of the PE if the confidence is low.
-    Emulating may create un-trusty results, but it's likely that it will actually improve the final result;
-    as it will (try to) re-create parts of the PE that couldn't be understood.
-    The program will still prefer to not emulate when possible, even if --allow-emulation is passed.""")
+    parser.add_argument("--allow-dynamic", action="store_true", help="""Use Qiling dynamic analysis if available""")
     parser.add_argument("--log", action="store_true",
                         help="""If passed the script will create a log inf the --log-dir directory""")
     parser.add_argument("--build", action="store_true",
@@ -152,26 +142,18 @@ def main(argv):
     if not Path(args.exe).exists():
         raise ExeTraducerError(f".exe file not found: '{args.exe}'.", 2)
 
-    try:
-        run_pipeline(
-            args.exe,
-            system=args.system,
-            junk_out=args.junk_out,
-            project_out=args.project_out,
-            verbose=args.verbose,
-            log=args.log,
-            min_wide=args.min_wide,
-            min_ascii=args.min_ascii,
-            allow_emulation=args.allow_emulation,
-            force=args.force,
-            build=args.build,
-            clang_path=args.clang
-        )
-    except Exception as e:
-        if type(e).__name__ == 'ExeTraducerError':
-            raise
-        else:
-            print("[ERROR] Pipeline failed:", type(e).__name__, e.args[0], print_tb(e.__traceback__), file=sys.stderr)
+    run_pipeline(
+        args.exe,
+        system=args.system,
+        junk_out=args.junk_out,
+        project_out=args.project_out,
+        verbose=args.verbose,
+        log=args.log,
+        allow_emulation=args.allow_dynamic,
+        force=args.force,
+        build=args.build,
+        clang_path=args.clang
+    )
 
 if __name__ == "__main__":
     main(sys.argv[1:])
