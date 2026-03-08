@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/ExeTraducer.iml" filepath="$PROJECT_DIR$/.idea/ExeTraducer.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/win_abi_translation.iml" filepath="$PROJECT_DIR$/.idea/win_abi_translation.iml" />
     </modules>
   </component>
 </project>
