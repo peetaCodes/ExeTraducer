@@ -1,3 +1,8 @@
+> [!WARNING]
+> This repo was scraped. I've realised that my code was flawed and it needed a big reboot.
+> This was NEVER finished and never will.
+> Please use the [new repo](https://github.com/peetaCodes/UniversalBinary) only.
+
 > [!NOTE]
 > This repo is a work-in-progress
 
